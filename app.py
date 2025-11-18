@@ -40,11 +40,11 @@ password_enc = urllib.parse.quote_plus(password)
 driver_enc = urllib.parse.quote_plus(driver)
 
 db_uri = f"mssql+pyodbc://@{server}/{database}?driver={driver_enc}"
-# include_tables = ['Employee', 'Office', 'OfficeTeam', 'OfficeTeamEmployee']
+include_tables = ['Employee', 'Customer']
 
 try:
-    # db = SQLDatabase.from_uri(str(db_uri), include_tables=include_tables)
-    db = SQLDatabase.from_uri(str(db_uri))
+    db = SQLDatabase.from_uri(str(db_uri), include_tables=include_tables)
+    # db = SQLDatabase.from_uri(str(db_uri))
     logger.info(f"Connected to DB. Using tables: {db.get_table_names()}")
 except Exception as e:
     logger.critical(f"CRITICAL Error connecting to database: {e}")
@@ -75,8 +75,8 @@ agent_executor = create_sql_agent(
     llm=llm,
     db=db,
     prompt=prompt_template,
-    agent_type="openai-tools",
-    verbose=True,
+    agent_type="tool-calling",
+    # verbose=True,
     handle_parsing_errors=True,
     # return_intermediate_steps=True
 )
@@ -84,43 +84,20 @@ agent_executor = create_sql_agent(
 class GeminiSanitizedHistory(ChatMessageHistory):
     def add_user_message(self, message: str | BaseMessage):
         if isinstance(message, BaseMessage):
-            content = message.content
+            self.messages.append(message) # Store the object directly
         else:
-            content = str(message)
-        self.messages.append({"role": "user", "content": content})
+            self.messages.append(HumanMessage(content=str(message)))
 
     def add_ai_message(self, message: str | BaseMessage):
         if isinstance(message, BaseMessage):
-            content = message.content
-            if isinstance(content, list):
-                content = "".join(
-                    part.get("text", "") if isinstance(part, dict) else str(part)
-                    for part in content
-                )
+            self.messages.append(message) # Store the object directly
         else:
-            content = str(message)
-        self.messages.append({"role": "assistant", "content": content})
+            self.messages.append(AIMessage(content=str(message)))
 
 store = {}
 def get_session_history(session_id: str):
     if session_id not in store:
         store[session_id] = GeminiSanitizedHistory()
-
-    # messages_text = []
-    # for msg in store[session_id].messages:
-    #     if isinstance(msg, AIMessage):
-    #         role = "ai"
-    #         content = msg.content
-    #     elif isinstance(msg, HumanMessage):
-    #         role = "user"
-    #         content = msg.content
-    #     else:
-    #         role = "unknown"
-    #         content = str(msg)
-    #     messages_text.append(f"{role}: {content}")
-
-    # print("HISTORY:\n" + "\n".join(messages_text))
-
     return store[session_id]
 
 agent_with_history = RunnableWithMessageHistory(
@@ -171,11 +148,10 @@ def ask_agent():
     logger.info(f"Session: {session_id} | Question: {question}")
 
     history = get_session_history(session_id)
-    history.add_user_message(question)
-
+    print(f"HISTORY: {history.messages}")
+    
     try:
-        response = run_agent(question, session_id)        
-
+        response = run_agent(question, session_id) 
         clean_text = re.sub(r'[*]+', '', response).strip()
 
         # for item in response["output"]:
@@ -187,7 +163,7 @@ def ask_agent():
         # clean_text = re.sub(r'[*]+', '', full_text)
         # clean_text = re.sub(r'\s*\n\s*', '\n', clean_text)
         # clean_text = clean_text.strip()
-        history.add_ai_message(response)
+        
         return jsonify({
             "answer": clean_text,
             # "intermediate_steps": str(response["intermediate_steps"])
