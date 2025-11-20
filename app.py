@@ -10,6 +10,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.output_parsers import StrOutputParser
 from flask import Flask, request, jsonify
+from functools import wraps
 import logging
 import urllib
 import re
@@ -29,8 +30,9 @@ username = os.getenv("MS_SQL_USER")
 password = os.getenv("MS_SQL_PASSWORD")
 driver = os.getenv("MS_SQL_DRIVER", "ODBC Driver 17 for SQL Server")
 
-google_api_key = os.environ["GOOGLE_API_KEY"]
+google_api_key = os.getenv("GOOGLE_API_KEY")
 model_name = os.getenv("gpt_deployment_name")
+api_access_key = os.getenv("API_ACCESS_KEY")
 
 if not all([server, database, google_api_key]):
     logger.error("CRITICAL: Missing required environment variables. Check .env file.")
@@ -40,11 +42,11 @@ password_enc = urllib.parse.quote_plus(password)
 driver_enc = urllib.parse.quote_plus(driver)
 
 db_uri = f"mssql+pyodbc://@{server}/{database}?driver={driver_enc}"
-include_tables = ['Employee', 'Customer']
+# include_tables = ['Employee', 'Customer']
 
 try:
-    db = SQLDatabase.from_uri(str(db_uri), include_tables=include_tables)
-    # db = SQLDatabase.from_uri(str(db_uri))
+    # db = SQLDatabase.from_uri(str(db_uri), include_tables=include_tables)
+    db = SQLDatabase.from_uri(str(db_uri))
     logger.info(f"Connected to DB. Using tables: {db.get_table_names()}")
 except Exception as e:
     logger.critical(f"CRITICAL Error connecting to database: {e}")
@@ -59,9 +61,30 @@ llm = ChatGoogleGenerativeAI(
 )
 
 system_message = """
-You are a helpful SQL agent. Your name is DataBot.
-Do not answer questions about sensitive data like passwords.
-"""
+You are an agent designed to interact with a SQL database. Your name is DataBot
+Given an input question, create a syntactically correct {dialect} query to run,
+then look at the results of the query and return the answer. Unless the user
+specifies a specific number of examples they wish to obtain, always limit your
+query to at most {top_k} results.
+
+You can order the results by a relevant column to return the most interesting
+examples in the database. Never query for all the columns from a specific table,
+only ask for the relevant columns given the question.
+
+You MUST double check your query before executing it. If you get an error while
+executing a query, rewrite the query and try again.
+
+DO NOT make any DML statements (INSERT, UPDATE, DELETE, DROP etc.) to the
+database and do not answer questions about sensitive data like passwords.
+
+To start you should ALWAYS look at the tables in the database to see what you
+can query. Do NOT skip this step.
+
+Then you should query the schema of the most relevant tables.
+""".format(
+    dialect=db.dialect,
+    top_k=10,
+)
 
 prompt_template = ChatPromptTemplate.from_messages([
     ("system", system_message),
@@ -76,7 +99,7 @@ agent_executor = create_sql_agent(
     db=db,
     prompt=prompt_template,
     agent_type="tool-calling",
-    # verbose=True,
+    verbose=True,
     handle_parsing_errors=True,
     # return_intermediate_steps=True
 )
@@ -84,13 +107,13 @@ agent_executor = create_sql_agent(
 class GeminiSanitizedHistory(ChatMessageHistory):
     def add_user_message(self, message: str | BaseMessage):
         if isinstance(message, BaseMessage):
-            self.messages.append(message) # Store the object directly
+            self.messages.append(message)
         else:
             self.messages.append(HumanMessage(content=str(message)))
 
     def add_ai_message(self, message: str | BaseMessage):
         if isinstance(message, BaseMessage):
-            self.messages.append(message) # Store the object directly
+            self.messages.append(message)
         else:
             self.messages.append(AIMessage(content=str(message)))
 
@@ -127,11 +150,26 @@ def run_agent(question, session_id):
 
     return str(result)
 
+def require_api_key(view_function):
+    @wraps(view_function)
+    def decorated_function(*args, **kwargs):
+        if not api_access_key:
+            logger.warning("API Key not configured in environment")
+            return jsonify({"error": "Server misconfiguration"}), 500
+            
+        if request.headers.get('x-api-key') and request.headers.get('x-api-key') == api_access_key:
+            return view_function(*args, **kwargs)
+        else:
+            logger.warning(f"Unauthorized access attempt from {request.remote_addr}")
+            return jsonify({"error": "Unauthorized"}), 401
+    return decorated_function
+
 logger.info("--- SQL Agent is Ready ---")
 
 app = Flask(__name__)
 
 @app.route("/ask", methods=['POST'])
+@require_api_key
 def ask_agent():
     data = request.json
 
@@ -144,6 +182,9 @@ def ask_agent():
     if not question:
         logger.warning("API call missing 'question' in JSON body")
         return jsonify({"error": "No question provided. Use {'question': '...'}"}), 400
+    if not session_id:
+        logger.warning("API call missing 'session_id' in JSON body")
+        return jsonify({"error": "No session_id provided. Use {'session_id': '...'}"}), 400
 
     logger.info(f"Session: {session_id} | Question: {question}")
 
@@ -153,16 +194,6 @@ def ask_agent():
     try:
         response = run_agent(question, session_id) 
         clean_text = re.sub(r'[*]+', '', response).strip()
-
-        # for item in response["output"]:
-        #     if isinstance(item, dict) and "text" in item:
-        #         full_text += item["text"]
-        #     elif isinstance(item, str):
-        #         full_text += item
-
-        # clean_text = re.sub(r'[*]+', '', full_text)
-        # clean_text = re.sub(r'\s*\n\s*', '\n', clean_text)
-        # clean_text = clean_text.strip()
         
         return jsonify({
             "answer": clean_text,
